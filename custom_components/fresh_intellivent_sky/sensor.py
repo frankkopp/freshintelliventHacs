@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+from struct import pack, unpack
 
 from homeassistant.components.sensor import (
     SensorDeviceClass,
@@ -105,8 +106,67 @@ async def async_setup_entry(
                     icon="mdi:fan-clock",
                 ),
             ),
+            FreshIntelliventSkyRawSensor(
+                coordinator,
+                coordinator.data,
+                SensorEntityDescription(
+                    device_class=SensorDeviceClass.TEMPERATURE,
+                    key="temperature_byte13",
+                    name="Temperature (byte 13)",
+                    native_unit_of_measurement=UnitOfTemperature.CELSIUS,
+                    state_class=SensorStateClass.MEASUREMENT,
+                ),
+                "temperature",
+            ),
+            FreshIntelliventSkyRawSensor(
+                coordinator,
+                coordinator.data,
+                SensorEntityDescription(
+                    key="voc_raw",
+                    name="VOC raw",
+                    icon="mdi:scent",
+                    state_class=SensorStateClass.MEASUREMENT,
+                ),
+                "voc_raw",
+                with_packet=True,
+            ),
         ]
     )
+
+
+# Local diagnostics only (branch diag/raw-sensors, not for upstream).
+# pyfreshintellivent 0.3.4 splits the 15-byte status packet with the layout
+# below and keeps the resulting tuple in SkySensors._values. Packing that tuple
+# again yields the exact bytes the fan sent, which are then decoded with the
+# layout documented for pyfreshintellivent 1.0 (characteristics.md):
+# bytes 4-5 are the odour/VOC level (0.3.4 reports them as temperature / 100)
+# and byte 13 is the temperature in whole degrees.
+_LAYOUT_V034 = "<2B2H2B2H3B"
+_LAYOUT_V100 = "<BB5H3B"
+_FIELDS_V100 = (
+    "flags_raw",
+    "mode_raw",
+    "humidity_raw",
+    "voc_raw",
+    "light_raw",
+    "rpm",
+    "reference_raw",
+    "minutes_active",
+    "temperature",
+    "error_code",
+)
+
+
+def _decode_v100(sensors) -> dict | None:
+    """Rebuild the status packet from 0.3.4's tuple and decode it the 1.0 way."""
+    values = getattr(sensors, "_values", None)
+    if values is None:
+        return None
+
+    raw = pack(_LAYOUT_V034, *values)
+    decoded = dict(zip(_FIELDS_V100, unpack(_LAYOUT_V100, raw)))
+    decoded["raw_hex"] = raw.hex()
+    return decoded
 
 
 class FreshIntelliventSkySensor(
@@ -169,3 +229,35 @@ class FreshIntelliventSkyBoostRemainingSensor(FreshIntelliventSkySensor):
             return 0
 
         return boost.get("seconds")
+
+
+class FreshIntelliventSkyRawSensor(FreshIntelliventSkySensor):
+    """Diagnostic field of the status packet, decoded with the 1.0 layout."""
+
+    def __init__(
+        self,
+        coordinator: DataUpdateCoordinator,
+        device: FreshIntelliVent,
+        entity_description: SensorEntityDescription,
+        field: str,
+        with_packet: bool = False,
+    ) -> None:
+        """Populate the entity with the packet field it shows."""
+        super().__init__(
+            coordinator, device, entity_description, EntityCategory.DIAGNOSTIC
+        )
+        self._field = field
+        self._with_packet = with_packet
+
+    @property
+    def native_value(self) -> StateType:
+        """Return the decoded field."""
+        decoded = _decode_v100(self.coordinator.data.sensors)
+        return None if decoded is None else decoded[self._field]
+
+    @property
+    def extra_state_attributes(self) -> dict | None:
+        """Return the whole decoded packet on the entity that asks for it."""
+        if not self._with_packet:
+            return None
+        return _decode_v100(self.coordinator.data.sensors)
